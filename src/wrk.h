@@ -27,7 +27,9 @@ extern const char *VERSION;
 typedef struct {
     pthread_t thread;
     aeEventLoop *loop;
+    struct address_state *local_addr;
     struct addrinfo *addr;
+    uint64_t local_addr_range;
     uint64_t connections;
     uint64_t complete;
     uint64_t requests;
@@ -62,5 +64,14 @@ typedef struct connection {
     buffer body;
     char buf[RECVBUF];
 } connection;
+
+typedef struct address_state {
+	struct addrinfo local_addr;
+	uint64_t range;
+	uint64_t cur;
+} address_state;
+
+static address_state *create_addr_state(struct addrinfo *addr, int range);
+static int addr_next(address_state *addr, struct sockaddr_storage *store);
 
 #endif /* WRK_H */

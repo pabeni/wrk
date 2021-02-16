@@ -8,6 +8,8 @@ static struct config {
     uint64_t connections;
     uint64_t duration;
     uint64_t threads;
+    struct addrinfo local_ip;
+    uint64_t local_ip_range;
     uint64_t timeout;
     uint64_t pipeline;
     bool     delay;
@@ -47,6 +49,11 @@ static void usage() {
            "    -c, --connections <N>  Connections to keep open   \n"
            "    -d, --duration    <T>  Duration of test           \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
+           "    -l, --local_ip    <I>  bind to the specified IP   \n"
+           "                           address.                   \n"
+           "    -r, --range       <R>  If a local IP is provided, \n"
+           "                           use the address range      \n"
+           "                           <IP>..<IP + R> round robin \n"
            "                                                      \n"
            "    -s, --script      <S>  Load Lua script file       \n"
            "    -H, --header      <H>  Add header to request      \n"
@@ -105,6 +112,7 @@ int main(int argc, char **argv) {
         thread *t      = &threads[i];
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = cfg.connections / cfg.threads;
+        t->local_addr  = create_addr_state(&cfg.local_ip, cfg.local_ip_range);
 
         t->L = script_create(cfg.script, url, headers);
         script_init(L, t, argc - optind, &argv[optind]);
@@ -236,12 +244,19 @@ void *thread_main(void *arg) {
 static int connect_socket(thread *thread, connection *c) {
     struct addrinfo *addr = thread->addr;
     struct aeEventLoop *loop = thread->loop;
+    struct sockaddr_storage local;
+    int local_len;
     int fd, flags;
 
     fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
 
+    local_len = addr_next(thread->local_addr, &local);
+
     flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    if (local_len && bind(fd, (const struct sockaddr *)&local, local_len) == -1)
+        goto error;
 
     if (connect(fd, addr->ai_addr, addr->ai_addrlen) == -1) {
         if (errno != EINPROGRESS) goto error;
@@ -466,10 +481,80 @@ static char *copy_url_part(char *url, struct http_parser_url *parts, enum http_p
     return part;
 }
 
+static int scan_ip(char *s, struct addrinfo *addr) {
+    struct sockaddr_storage in;
+    char *addr_data = (char *)&((struct sockaddr_in *)&in)->sin_addr;
+    int af = AF_INET;
+
+    addr->ai_addrlen = sizeof(struct sockaddr_in);
+
+again:
+    memset(&in, 0, sizeof(struct sockaddr_storage));
+    if (inet_pton(af, s, addr_data)) {
+        in.ss_family = af;
+        addr->ai_family = af;
+        addr->ai_addr = malloc(addr->ai_addrlen);
+        if (!addr->ai_addr)
+            return -1;
+        memcpy(addr->ai_addr, &in, addr->ai_addrlen);
+        return 0;
+    }
+    if (af == AF_INET) {
+        af = AF_INET6;
+        addr->ai_addrlen = sizeof(struct sockaddr_in6);
+        addr_data = (char *)&((struct sockaddr_in6 *)&in)->sin6_addr;
+        goto again;
+    }
+    return -1;
+}
+
+static address_state *create_addr_state(struct addrinfo *addr, int range) {
+    address_state *state = zmalloc(sizeof(address_state));
+
+    if (!state)
+        return NULL;
+
+    memcpy(&state->local_addr, addr, sizeof(struct addrinfo));
+    state->local_addr.ai_addr = zmalloc(addr->ai_addrlen);
+    if (!state->local_addr.ai_addr)
+        return NULL;
+
+    memcpy(state->local_addr.ai_addr, addr->ai_addr, addr->ai_addrlen);
+    state->range = range;
+    return state;
+}
+
+static uint32_t *last_32_bits(void *addr, int family) {
+    if (family == AF_INET)
+        return &((struct sockaddr_in *)addr)->sin_addr.s_addr;
+    return &((struct sockaddr_in6 *)addr)->sin6_addr.s6_addr32[3];
+}
+
+static int addr_next(address_state *addr, struct sockaddr_storage *store) {
+    uint32_t low_word;
+
+    if (!addr)
+        return 0;
+
+    memcpy(store, addr->local_addr.ai_addr, addr->local_addr.ai_addrlen);
+    if (!addr->range)
+        return addr->local_addr.ai_addrlen;
+
+    low_word = ntohl(*last_32_bits(addr->local_addr.ai_addr, addr->local_addr.ai_family));
+    low_word += addr->cur;
+    if (++(addr->cur) == addr->range)
+        addr->cur = 0;
+
+    *last_32_bits(store, addr->local_addr.ai_family) = htonl(low_word);
+    return addr->local_addr.ai_addrlen;
+}
+
 static struct option longopts[] = {
     { "connections", required_argument, NULL, 'c' },
     { "duration",    required_argument, NULL, 'd' },
     { "threads",     required_argument, NULL, 't' },
+    { "local_ip",    required_argument, NULL, 'l' },
+    { "range",       required_argument, NULL, 'r' },
     { "script",      required_argument, NULL, 's' },
     { "header",      required_argument, NULL, 'H' },
     { "latency",     no_argument,       NULL, 'L' },
@@ -489,7 +574,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:l:r:s:H:T:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -499,6 +584,12 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
+                break;
+            case 'l':
+                if (scan_ip(optarg, &cfg->local_ip)) return -1;
+                break;
+            case 'r':
+                cfg->local_ip_range = atoi(optarg);
                 break;
             case 's':
                 cfg->script = optarg;
